@@ -302,4 +302,283 @@ This project is for demonstration and educational purposes.
 
 ## Authors
 
-Grid Dynamics
+Anusruta Dutta
+
+---
+
+## Solution: Request Collapsing Implementation
+
+### Problem Overview
+
+In the initial implementation, when a search request is received by the consumer service, all 50 consumer nodes would independently make requests to the producer service. This created a "Thundering Herd" scenario where:
+- **50 simultaneous HTTP requests** to the producer for the same data
+- **High network overhead** and resource consumption
+- **Database contention** from multiple identical queries
+- **Poor scalability** as the number of nodes increases
+
+### Implemented Solution
+
+The solution implements a **Leader Election and Distributed Caching** pattern to reduce the 50 individual requests to a **single request** from one elected leader node.
+
+#### Architecture Changes
+
+```mermaid
+graph TB
+    Client[Client/User]
+    
+    subgraph Consumer["Consumer Service :8081 with Hazelcast Cluster"]
+        API[HTTP Server<br/>GET /search]
+        Leader[Leader Node]
+        Node1[Follower Node 1]
+        Node2[Follower Node 2]
+        NodeN[Follower Node N]
+        Cache[(Distributed Cache<br/>Hazelcast IMap)]
+    end
+    
+    subgraph Producer["Producer Service :8080"]
+        PAPI[HTTP Server<br/>GET /]
+        Repo[DataRepository]
+    end
+    
+    subgraph Database["MySQL Database"]
+        DB[(data_storage)]
+    end
+    
+    Client -->|GET /search?key=value| API
+    API -->|1. Elect Leader| Leader
+    Leader -->|2. Single Request| PAPI
+    PAPI --> Repo
+    Repo -->|Query| DB
+    PAPI -->|3. Data Response| Leader
+    Leader -->|4. Store in Cache| Cache
+    Node1 -.->|5. Read from Cache| Cache
+    Node2 -.->|5. Read from Cache| Cache
+    NodeN -.->|5. Read from Cache| Cache
+    
+    style Consumer fill:#e1f5ff
+    style Producer fill:#fff4e1
+    style Database fill:#f0f0f0
+    style Leader fill:#90EE90
+    style Cache fill:#FFD700
+```
+
+#### Key Components
+
+##### 1. **HazelcastManager** - Distributed Data Grid
+Located at: [consumer-service/src/main/java/com/griddynamics/consumer/hazelcast/HazelcastManager.java](consumer-service/src/main/java/com/griddynamics/consumer/hazelcast/HazelcastManager.java)
+
+- **Purpose**: Provides distributed cache and coordination primitives
+- **Features**:
+  - In-memory distributed cache (`IMap`) for storing fetched data
+  - Atomic reference for leader election coordination
+  - Cluster awareness across multiple consumer instances
+
+```java
+public static IMap<String, String> getDataCache() {
+    return getInstance().getMap("data-cache");
+}
+```
+
+##### 2. **LeaderElection** - Coordination Pattern
+Located at: [consumer-service/src/main/java/com/griddynamics/consumer/election/LeaderElection.java](consumer-service/src/main/java/com/griddynamics/consumer/election/LeaderElection.java)
+
+- **Purpose**: Ensures only one node fetches from the producer
+- **Mechanism**:
+  - Uses Hazelcast's `FencedLock` for distributed locking
+  - First node to acquire lock becomes the leader
+  - Atomic reference stores the elected leader's ID
+
+```java
+public static String electLeader(String nodeId) {
+    FencedLock lock = hz.getCPSubsystem().getLock(LEADER_LOCK_NAME);
+    lock.lock();
+    try {
+        var leaderRef = hz.getCPSubsystem().getAtomicReference(LEADER_KEY);
+        String currentLeader = (String) leaderRef.get();
+        if (currentLeader == null || currentLeader.isEmpty()) {
+            leaderRef.set(nodeId);
+            return nodeId;
+        }
+        return currentLeader;
+    } finally {
+        lock.unlock();
+    }
+}
+```
+
+##### 3. **Modified ConsumerVerticle** - Single Request Pattern
+Located at: [consumer-service/src/main/java/com/griddynamics/consumer/ConsumerVerticle.java](consumer-service/src/main/java/com/griddynamics/consumer/ConsumerVerticle.java)
+
+**Workflow:**
+
+1. **Leader Election**: When a search request arrives, elect a leader among all nodes
+2. **Leader Fetches Data**: Only the leader makes the HTTP request to the producer
+3. **Cache Population**: Leader stores the response in the distributed cache
+4. **All Nodes Query Cache**: All 50 nodes read from the local/distributed cache
+5. **Aggregated Response**: Consumer service returns aggregated results
+
+**Code Flow:**
+```java
+private void handleSearch(RoutingContext ctx) {
+    String leader = LeaderElection.electLeader(nodeId);
+    
+    if (leader.equals(nodeId)) {
+        // This node is the leader - fetch from Producer
+        fetchFromProducerAndCache(searchKey)
+            .onSuccess(v -> queryAllNodes(ctx, searchKey, startTime));
+    } else {
+        // This node is a follower - wait for cache to be populated
+        vertx.setTimer(100, id -> queryAllNodes(ctx, searchKey, startTime));
+    }
+}
+```
+
+##### 4. **Modified Node Class** - Cache-First Strategy
+Located at: [consumer-service/src/main/java/com/griddynamics/consumer/models/Node.java](consumer-service/src/main/java/com/griddynamics/consumer/models/Node.java)
+
+- **Before**: Each node made HTTP requests to the producer
+- **After**: Each node only checks the distributed cache
+
+```java
+public Future<Boolean> checkData(String searchKey) {
+    var cache = HazelcastManager.getDataCache();
+    
+    if (cache.containsKey(searchKey)) {
+        logger.debug("[{}] Cache HIT for key: {}", nodeId, searchKey);
+        return Future.succeededFuture(true);
+    }
+    
+    logger.debug("[{}] Cache MISS for key: {}", nodeId, searchKey);
+    return Future.succeededFuture(false);
+}
+```
+
+#### Updated Dependencies
+
+Added to [consumer-service/pom.xml](consumer-service/pom.xml):
+
+```xml
+<dependency>
+    <groupId>com.hazelcast</groupId>
+    <artifactId>hazelcast</artifactId>
+    <version>5.3.5</version>
+</dependency>
+```
+
+#### Sequence Diagram - Optimized Flow
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant ConsumerAPI as Consumer API
+    participant Leader as Leader Node
+    participant Followers as Follower Nodes (49)
+    participant Cache as Hazelcast Cache
+    participant ProducerAPI as Producer API
+    participant DB as MySQL Database
+
+    Note over Client,DB: Optimized Search Flow (Single Request)
+    
+    Client->>+ConsumerAPI: GET /search?key=hello
+    ConsumerAPI->>ConsumerAPI: Elect Leader
+    
+    Note over Leader: Leader elected from 50 nodes
+    
+    Leader->>+ProducerAPI: Single GET / request
+    ProducerAPI->>+DB: SELECT id, data FROM data_storage
+    DB-->>-ProducerAPI: Return all records
+    ProducerAPI-->>-Leader: JSON Array [{id, content}...]
+    
+    Leader->>+Cache: Store data in distributed cache
+    Cache-->>-Leader: Data cached
+    
+    par All Nodes Query Cache (Instead of Producer)
+        Leader->>Cache: Read from cache
+        Followers->>Cache: Read from cache (49 nodes)
+    end
+    
+    Cache-->>Leader: Data (if found)
+    Cache-->>Followers: Data (if found)
+    
+    ConsumerAPI->>ConsumerAPI: Aggregate results from all nodes
+    ConsumerAPI-->>-Client: JSON Response<br/>{searched_for, nodes_found, response_time_ms}
+```
+
+### Benefits of the Solution
+
+| Metric | Before (50 Requests) | After (1 Request) | Improvement |
+|--------|---------------------|-------------------|-------------|
+| **HTTP Requests to Producer** | 50 | 1 | **98% reduction** |
+| **Network Calls** | 50 concurrent | 1 | **49x fewer calls** |
+| **Database Queries** | 50 identical queries | 1 | **98% reduction** |
+| **Producer Load** | High contention | Single request | **Minimal load** |
+| **Response Time** | High latency | Low latency | **Faster** |
+| **Scalability** | Poor (O(n) requests) | Good (O(1) request) | **Highly scalable** |
+
+### How It Works
+
+1. **Search Request Arrives**: Client sends `GET /search?key=hello`
+2. **Leader Election**: ConsumerVerticle initiates leader election using Hazelcast distributed lock
+3. **Leader Fetches**: Elected leader makes a **single HTTP request** to the producer
+4. **Cache Population**: Leader stores the response in Hazelcast distributed cache
+5. **Follower Wait**: Non-leader nodes wait 100ms for cache population
+6. **All Nodes Read Cache**: All 50 nodes check the distributed cache (no HTTP calls)
+7. **Aggregated Response**: Consumer service aggregates cache hit results and returns to client
+
+### Testing the Solution
+
+#### Health Check Endpoint
+
+Check the consumer service health and cluster status:
+
+```bash
+curl http://localhost:8081/health
+```
+
+Response:
+```json
+{
+  "status": "UP",
+  "consumer_service": "healthy",
+  "hazelcast_cluster": 1,
+  "producer_service": "connected",
+  "producer_status": 200,
+  "timestamp": 1706745600000
+}
+```
+
+#### Search with Single Request
+
+```bash
+curl "http://localhost:8081/search?key=hello%20world"
+```
+
+Response:
+```json
+{
+  "searched_for": "hello world",
+  "total_nodes": 50,
+  "nodes_found": 50,
+  "response_time_ms": 45,
+  "timestamp": 1706745600000
+}
+```
+
+#### Observing the Behavior
+
+Check the logs to see:
+- **Leader election**: Only one node logs "elected as LEADER"
+- **Single request**: Only one HTTP request to producer at `localhost:8080`
+- **Cache operations**: 49 follower nodes log "Cache HIT" or "Cache MISS"
+
+### Conclusion
+
+This implementation successfully transforms the **Thundering Herd** problem into an efficient **Request Collapsing** pattern:
+
+✅ **Single request** instead of 50 simultaneous requests  
+✅ **Distributed caching** with Hazelcast for fast data access  
+✅ **Leader election** for coordination without race conditions  
+✅ **Reduced load** on producer service and database  
+✅ **Improved performance** and scalability  
+
+The solution demonstrates how distributed coordination patterns can dramatically reduce backend load while maintaining functionality across multiple consumer nodes.
