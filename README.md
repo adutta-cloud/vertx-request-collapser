@@ -302,4 +302,326 @@ This project is for demonstration and educational purposes.
 
 ## Authors
 
-Grid Dynamics
+Anusruta Dutta
+
+---
+
+## Solution: Request Collapsing Implementation
+
+### Problem Overview
+
+In the initial implementation, when a search request is received by the consumer service, all 50 consumer nodes would independently make requests to the producer service. This created a "Thundering Herd" scenario where:
+- **50 simultaneous HTTP requests** to the producer for the same data
+- **High network overhead** and resource consumption
+- **Database contention** from multiple identical queries
+- **Poor scalability** as the number of nodes increases
+
+### Implemented Solution
+
+The solution implements a **Leader Election and Shared Caching** pattern using **Vert.x SharedData** to reduce the 50 individual requests to a **single request** from one elected leader node.
+
+#### Architecture Changes
+
+```mermaid
+graph TB
+    Client[Client/User]
+    
+    subgraph Consumer["Consumer Service :8081 with Vert.x SharedData"]
+        API[HTTP Server<br/>GET /search]
+        Leader[Leader Node]
+        Node1[Follower Node 1]
+        Node2[Follower Node 2]
+        NodeN[Follower Node N]
+        Cache[(Shared Cache<br/>Vert.x LocalMap)]
+    end
+    
+    subgraph Producer["Producer Service :8080"]
+        PAPI[HTTP Server<br/>GET /]
+        Repo[DataRepository]
+    end
+    
+    subgraph Database["MySQL Database"]
+        DB[(data_storage)]
+    end
+    
+    Client -->|GET /search?key=value| API
+    API -->|1. Elect Leader| Leader
+    Leader -->|2. Single Request| PAPI
+    PAPI --> Repo
+    Repo -->|Query| DB
+    PAPI -->|3. Data Response| Leader
+    Leader -->|4. Store in Cache| Cache
+    Node1 -.->|5. Read from Cache| Cache
+    Node2 -.->|5. Read from Cache| Cache
+    NodeN -.->|5. Read from Cache| Cache
+    
+    style Consumer fill:#e1f5ff
+    style Producer fill:#fff4e1
+    style Database fill:#f0f0f0
+    style Leader fill:#90EE90
+    style Cache fill:#FFD700
+```
+
+#### Key Components
+
+##### 1. **SharedDataManager** - Vert.x In-Memory Cache
+Located at: [consumer-service/src/main/java/com/griddynamics/consumer/cache/SharedDataManager.java](consumer-service/src/main/java/com/griddynamics/consumer/cache/SharedDataManager.java)
+
+- **Purpose**: Provides shared cache and coordination primitives using Vert.x native features
+- **Features**:
+  - In-memory shared cache (`LocalMap`) for storing fetched data across verticles
+  - Leader election state management
+  - No external dependencies - pure Vert.x solution
+
+```java
+public static LocalMap<String, String> getDataCache(Vertx vertx) {
+    return vertx.sharedData().getLocalMap(DATA_CACHE_NAME);
+}
+
+public static void cacheData(Vertx vertx, String key, String data) {
+    getDataCache(vertx).put(key, data);
+}
+```
+
+##### 2. **LeaderElection** - Synchronized Coordination Pattern
+Located at: [consumer-service/src/main/java/com/griddynamics/consumer/election/LeaderElection.java](consumer-service/src/main/java/com/griddynamics/consumer/election/LeaderElection.java)
+
+- **Purpose**: Ensures only one node fetches from the producer within a single JVM
+- **Mechanism**:
+  - Uses Java's `synchronized` keyword for thread-safe leader election
+  - First concurrent request becomes the leader
+  - Leader ID stored in Vert.x SharedData `LocalMap`
+
+```java
+public static synchronized String electLeader(Vertx vertx, String nodeId) {
+    String currentLeader = SharedDataManager.getLeader(vertx);
+    
+    if (currentLeader == null || currentLeader.isEmpty()) {
+        SharedDataManager.setLeader(vertx, nodeId);
+        logger.info("Node {} elected as LEADER", nodeId);
+        return nodeId;
+    }
+    
+    logger.debug("Node {} joined | Current leader: {}", nodeId, currentLeader);
+    return currentLeader;
+}
+```
+
+##### 3. **Modified ConsumerVerticle** - Single Request Pattern
+Located at: [consumer-service/src/main/java/com/griddynamics/consumer/ConsumerVerticle.java](consumer-service/src/main/java/com/griddynamics/consumer/ConsumerVerticle.java)
+
+**Workflow:**
+
+1. **Cache Check**: First check if data exists in Vert.x SharedData cache
+2. **Leader Election**: If cache miss, elect a leader among concurrent requests
+3. **Leader Fetches Data**: Only the leader makes the HTTP request to the producer
+4. **Cache Population**: Leader stores the response in Vert.x shared cache
+5. **Direct Response**: Leader and followers respond directly with cached data
+
+**Code Flow:**
+```java
+private void handleSearch(RoutingContext ctx) {
+    // Check cache first
+    String cachedData = SharedDataManager.getCachedData(vertx, searchKey);
+    if (cachedData != null) {
+        logger.debug("Cache HIT for key: {}", searchKey);
+        respondWithCacheResults(ctx, searchKey, cachedData, startTime);
+        return;
+    }
+    
+    // Cache miss - elect leader to fetch data
+    String leader = LeaderElection.electLeader(vertx, nodeId);
+    
+    if (leader.equals(nodeId)) {
+        // This node is the leader - fetch from Producer
+        fetchFromProducerAndCache(searchKey)
+            .onSuccess(v -> {
+                String data = SharedDataManager.getCachedData(vertx, searchKey);
+                respondWithCacheResults(ctx, searchKey, data, startTime);
+            });
+    } else {
+        // This node is a follower - wait for cache to be populated
+        vertx.setTimer(50, id -> {
+            String data = SharedDataManager.getCachedData(vertx, searchKey);
+            respondWithCacheResults(ctx, searchKey, data, startTime);
+        });
+    }
+}
+```
+
+**Key Changes from Original:**
+- **No separate Node class**: All logic consolidated in ConsumerVerticle
+- **Cache-first approach**: Check cache before any election or fetching
+- **Reduced wait time**: Followers wait only 50ms (down from 100ms)
+- **Direct response**: No aggregation of 50 node results - single response with data
+
+#### Vert.x-Only Implementation
+
+**No External Dependencies Required!**
+
+The solution uses only Vert.x built-in features:
+- `vertx.sharedData().getLocalMap()` - Shared in-memory cache
+- Java `synchronized` keyword - Thread-safe leader election
+- `vertx.setTimer()` - Asynchronous wait for followers
+
+Dependencies in [consumer-service/pom.xml](consumer-service/pom.xml) remain minimal:
+
+```xml
+<dependency>
+    <groupId>io.vertx</groupId>
+    <artifactId>vertx-web</artifactId>
+    <version>${vertx.version}</version>
+</dependency>
+<dependency>
+    <groupId>io.vertx</groupId>
+    <artifactId>vertx-web-client</artifactId>
+    <version>4.4.4</version>
+</dependency>
+```
+
+#### Sequence Diagram - Optimized Flow
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant ConsumerAPI as Consumer API
+    participant Leader as Leader Request
+    participant Follower as Follower Request
+    participant Cache as Vert.x SharedData<br/>(LocalMap)
+    participant ProducerAPI as Producer API
+    participant DB as MySQL Database
+
+    Note over Client,DB: Optimized Search Flow (Single Request)
+    
+    Client->>+ConsumerAPI: GET /search?key=hello
+    ConsumerAPI->>+Cache: Check if data exists
+    Cache-->>-ConsumerAPI: Cache MISS
+    
+    ConsumerAPI->>ConsumerAPI: Elect Leader (synchronized)
+    
+    Note over Leader: First request elected as LEADER
+    
+    Leader->>+ProducerAPI: Single GET / request
+    ProducerAPI->>+DB: SELECT id, data FROM data_storage
+    DB-->>-ProducerAPI: Return all records
+    ProducerAPI-->>-Leader: JSON Array [{id, content}...]
+    
+    Leader->>+Cache: Store data in shared cache
+    Cache-->>-Leader: Data cached
+    
+    Leader->>Leader: Read from cache
+    Leader-->>ConsumerAPI: Return data response
+    ConsumerAPI-->>-Client: JSON Response<br/>{searched_for, found, data, response_time_ms}
+    
+    Note over Client,DB: Concurrent Request (Follower)
+    
+    Client->>+ConsumerAPI: GET /search?key=hello (concurrent)
+    ConsumerAPI->>+Cache: Check if data exists
+    Cache-->>-ConsumerAPI: Cache HIT (leader already cached)
+    ConsumerAPI-->>-Client: Immediate response from cache
+    
+    Note over Client,DB: OR if follower arrives during leader fetch:
+    
+    Follower->>ConsumerAPI: Concurrent request during leader fetch
+    ConsumerAPI->>Cache: Cache MISS (not yet populated)
+    ConsumerAPI->>ConsumerAPI: Not elected as leader
+    ConsumerAPI->>ConsumerAPI: Wait 50ms
+    ConsumerAPI->>Cache: Retry cache read
+    Cache-->>Follower: Cache HIT (leader populated it)
+    Follower-->>Client: Return cached data
+```
+
+### Benefits of the Solution
+
+| Metric | Before (50 Requests) | After (1 Request) | Improvement |
+|--------|---------------------|-------------------|-------------|
+| **HTTP Requests to Producer** | 50 | 1 | **98% reduction** |
+| **Network Calls** | 50 concurrent | 1 | **49x fewer calls** |
+| **Database Queries** | 50 identical queries | 1 | **98% reduction** |
+| **Producer Load** | High contention | Single request | **Minimal load** |
+| **Response Time** | High latency | Low latency | **Faster** |
+| **Scalability** | Poor (O(n) requests) | Good (O(1) request) | **Highly scalable** |
+
+### How It Works
+
+1. **Search Request Arrives**: Client sends `GET /search?key=hello`
+2. **Cache Check**: ConsumerVerticle checks Vert.x SharedData cache first
+3. **Cache Hit**: If data exists, return immediately (sub-millisecond response)
+4. **Cache Miss**: If data doesn't exist, proceed to leader election
+5. **Leader Election**: Use synchronized method to elect first request as leader
+6. **Leader Fetches**: Elected leader makes a **single HTTP request** to the producer
+7. **Cache Population**: Leader stores the response in Vert.x SharedData `LocalMap`
+8. **Leader Responds**: Leader returns the cached data immediately
+9. **Follower Wait**: Concurrent follower requests wait 50ms for cache population
+10. **Follower Responds**: Followers read from cache and return data directly
+
+**Note**: Only the **first request** per unique key makes an HTTP call. All subsequent requests (even concurrent ones) read from the shared cache.
+
+### Testing the Solution
+
+#### Health Check Endpoint
+
+Check the consumer service health and producer connectivity:
+
+```bash
+curl http://localhost:8081/health
+```
+
+Response:
+```json
+{
+  "status": "UP",
+  "consumer_service": "healthy",
+  "node_id": "Consumer-Node-1234567890",
+  "producer_service": "connected",
+  "producer_status": 200,
+  "timestamp": 1706745600000
+}
+```
+
+#### Search with Single Request
+
+```bash
+curl "http://localhost:8081/search?key=hello%20world"
+```
+
+Response:
+```json
+{
+  "searched_for": "hello world",
+  "found": true,
+  "response_time_ms": 45,
+  "data": [
+    {"id": 1, "content": "hello world"},
+    {"id": 2, "content": "test data"}
+  ],
+  "timestamp": 1706745600000
+}
+```
+
+#### Observing the Behavior
+
+Check the logs to see:
+- **First request**: Logs "Cache MISS" → "elected as LEADER" → "Fetching from Producer"
+- **Single HTTP call**: Only one request to producer at `localhost:8080`
+- **Subsequent requests**: Log "Cache HIT" → immediate response (no producer call)
+- **Concurrent requests**: Follower logs "waiting for leader" → reads from cache after 50ms
+
+### Conclusion
+
+This implementation successfully transforms the **Thundering Herd** problem into an efficient **Request Collapsing** pattern:
+
+✅ **Single request** instead of 50 simultaneous requests  
+✅ **In-memory caching** with Vert.x SharedData for fast data access  
+✅ **Leader election** using synchronized methods for coordination  
+✅ **Reduced load** on producer service and database (98% reduction)  
+✅ **No external dependencies** - pure Vert.x solution  
+✅ **Simple and maintainable** - leverages JVM synchronization primitives  
+
+**Trade-offs:**
+
+⚠️ **Single JVM scope**: Vert.x SharedData `LocalMap` only works within a single JVM instance  
+⚠️ **No distributed clustering**: For multi-instance deployments, consider Redis or Hazelcast  
+⚠️ **Increased latency**: Followers wait 50ms for leader to populate cache  
+
+The solution demonstrates how Vert.x built-in features can effectively reduce backend load through request collapsing, making it ideal for single-instance deployments or when external caching infrastructure is not available.

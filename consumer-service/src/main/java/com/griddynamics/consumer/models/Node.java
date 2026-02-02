@@ -1,9 +1,8 @@
 package com.griddynamics.consumer.models;
 
+import com.griddynamics.consumer.cache.SharedDataManager;
 import io.vertx.core.Future;
 import io.vertx.core.Vertx;
-import io.vertx.core.json.JsonArray;
-import io.vertx.core.json.JsonObject;
 import io.vertx.ext.web.client.WebClient;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -12,42 +11,31 @@ public class Node {
 
     private final String nodeId;
     private final WebClient webClient;
+    private final Vertx vertx;
     private static final Logger logger = LoggerFactory.getLogger(Node.class);
 
     public Node(Vertx vertx, String nodeId) {
+        this.vertx = vertx;
         this.nodeId = nodeId;
         this.webClient = WebClient.create(vertx);
     }
 
-    public Future<Boolean> checkData(String targetData) {
-        logger.info("[{}] Requesting data from Producer...", nodeId);
+    public Future<Boolean> checkData(String searchKey) {
+        logger.debug("[{}] Checking cache for key: {}", nodeId, searchKey);
 
-        return webClient.get(8080, "localhost", "/")
-                .send()
-                .compose(response -> {
-                    if (response.statusCode() != 200) {
-                        return Future.failedFuture("Producer returned status: " + response.statusCode());
-                    }
+        if (SharedDataManager.containsKey(vertx, searchKey)) {
+            logger.debug("[{}] Cache HIT for key: {}", nodeId, searchKey);
+            return Future.succeededFuture(true);
+        }
 
-                    JsonArray jsonArray = response.bodyAsJsonArray();
-                    boolean found = false;
-
-                    for (int i = 0; i < jsonArray.size(); i++) {
-                        JsonObject row = jsonArray.getJsonObject(i);
-                        if (row.getString("content").equals(targetData)) {
-                            found = true;
-                            break;
-                        }
-                    }
-                    logger.info("[{}] Search Result for '{}': {}", nodeId, targetData, found ? "FOUND" : "NOT FOUND");
-
-                    return Future.succeededFuture(found);
-                });
+        logger.debug("[{}] Cache MISS for key: {}", nodeId, searchKey);
+        return Future.succeededFuture(false);
     }
 
     public void close() {
         if (webClient != null) {
             webClient.close();
+            logger.debug("WebClient closed for node: {}", nodeId);
         }
     }
 }
