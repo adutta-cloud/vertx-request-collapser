@@ -318,7 +318,7 @@ In the initial implementation, when a search request is received by the consumer
 
 ### Implemented Solution
 
-The solution implements a **Leader Election and Distributed Caching** pattern to reduce the 50 individual requests to a **single request** from one elected leader node.
+The solution implements a **Leader Election and Shared Caching** pattern using **Vert.x SharedData** to reduce the 50 individual requests to a **single request** from one elected leader node.
 
 #### Architecture Changes
 
@@ -326,13 +326,13 @@ The solution implements a **Leader Election and Distributed Caching** pattern to
 graph TB
     Client[Client/User]
     
-    subgraph Consumer["Consumer Service :8081 with Hazelcast Cluster"]
+    subgraph Consumer["Consumer Service :8081 with Vert.x SharedData"]
         API[HTTP Server<br/>GET /search]
         Leader[Leader Node]
         Node1[Follower Node 1]
         Node2[Follower Node 2]
         NodeN[Follower Node N]
-        Cache[(Distributed Cache<br/>Hazelcast IMap)]
+        Cache[(Shared Cache<br/>Vert.x LocalMap)]
     end
     
     subgraph Producer["Producer Service :8080"]
@@ -364,45 +364,46 @@ graph TB
 
 #### Key Components
 
-##### 1. **HazelcastManager** - Distributed Data Grid
-Located at: [consumer-service/src/main/java/com/griddynamics/consumer/hazelcast/HazelcastManager.java](consumer-service/src/main/java/com/griddynamics/consumer/hazelcast/HazelcastManager.java)
+##### 1. **SharedDataManager** - Vert.x In-Memory Cache
+Located at: [consumer-service/src/main/java/com/griddynamics/consumer/cache/SharedDataManager.java](consumer-service/src/main/java/com/griddynamics/consumer/cache/SharedDataManager.java)
 
-- **Purpose**: Provides distributed cache and coordination primitives
+- **Purpose**: Provides shared cache and coordination primitives using Vert.x native features
 - **Features**:
-  - In-memory distributed cache (`IMap`) for storing fetched data
-  - Atomic reference for leader election coordination
-  - Cluster awareness across multiple consumer instances
+  - In-memory shared cache (`LocalMap`) for storing fetched data across verticles
+  - Leader election state management
+  - No external dependencies - pure Vert.x solution
 
 ```java
-public static IMap<String, String> getDataCache() {
-    return getInstance().getMap("data-cache");
+public static LocalMap<String, String> getDataCache(Vertx vertx) {
+    return vertx.sharedData().getLocalMap(DATA_CACHE_NAME);
+}
+
+public static void cacheData(Vertx vertx, String key, String data) {
+    getDataCache(vertx).put(key, data);
 }
 ```
 
-##### 2. **LeaderElection** - Coordination Pattern
+##### 2. **LeaderElection** - Synchronized Coordination Pattern
 Located at: [consumer-service/src/main/java/com/griddynamics/consumer/election/LeaderElection.java](consumer-service/src/main/java/com/griddynamics/consumer/election/LeaderElection.java)
 
-- **Purpose**: Ensures only one node fetches from the producer
+- **Purpose**: Ensures only one node fetches from the producer within a single JVM
 - **Mechanism**:
-  - Uses Hazelcast's `FencedLock` for distributed locking
-  - First node to acquire lock becomes the leader
-  - Atomic reference stores the elected leader's ID
+  - Uses Java's `synchronized` keyword for thread-safe leader election
+  - First concurrent request becomes the leader
+  - Leader ID stored in Vert.x SharedData `LocalMap`
 
 ```java
-public static String electLeader(String nodeId) {
-    FencedLock lock = hz.getCPSubsystem().getLock(LEADER_LOCK_NAME);
-    lock.lock();
-    try {
-        var leaderRef = hz.getCPSubsystem().getAtomicReference(LEADER_KEY);
-        String currentLeader = (String) leaderRef.get();
-        if (currentLeader == null || currentLeader.isEmpty()) {
-            leaderRef.set(nodeId);
-            return nodeId;
-        }
-        return currentLeader;
-    } finally {
-        lock.unlock();
+public static synchronized String electLeader(Vertx vertx, String nodeId) {
+    String currentLeader = SharedDataManager.getLeader(vertx);
+    
+    if (currentLeader == null || currentLeader.isEmpty()) {
+        SharedDataManager.setLeader(vertx, nodeId);
+        logger.info("Node {} elected as LEADER", nodeId);
+        return nodeId;
     }
+    
+    logger.debug("Node {} joined | Current leader: {}", nodeId, currentLeader);
+    return currentLeader;
 }
 ```
 
@@ -411,57 +412,70 @@ Located at: [consumer-service/src/main/java/com/griddynamics/consumer/ConsumerVe
 
 **Workflow:**
 
-1. **Leader Election**: When a search request arrives, elect a leader among all nodes
-2. **Leader Fetches Data**: Only the leader makes the HTTP request to the producer
-3. **Cache Population**: Leader stores the response in the distributed cache
-4. **All Nodes Query Cache**: All 50 nodes read from the local/distributed cache
-5. **Aggregated Response**: Consumer service returns aggregated results
+1. **Cache Check**: First check if data exists in Vert.x SharedData cache
+2. **Leader Election**: If cache miss, elect a leader among concurrent requests
+3. **Leader Fetches Data**: Only the leader makes the HTTP request to the producer
+4. **Cache Population**: Leader stores the response in Vert.x shared cache
+5. **Direct Response**: Leader and followers respond directly with cached data
 
 **Code Flow:**
 ```java
 private void handleSearch(RoutingContext ctx) {
-    String leader = LeaderElection.electLeader(nodeId);
+    // Check cache first
+    String cachedData = SharedDataManager.getCachedData(vertx, searchKey);
+    if (cachedData != null) {
+        logger.debug("Cache HIT for key: {}", searchKey);
+        respondWithCacheResults(ctx, searchKey, cachedData, startTime);
+        return;
+    }
+    
+    // Cache miss - elect leader to fetch data
+    String leader = LeaderElection.electLeader(vertx, nodeId);
     
     if (leader.equals(nodeId)) {
         // This node is the leader - fetch from Producer
         fetchFromProducerAndCache(searchKey)
-            .onSuccess(v -> queryAllNodes(ctx, searchKey, startTime));
+            .onSuccess(v -> {
+                String data = SharedDataManager.getCachedData(vertx, searchKey);
+                respondWithCacheResults(ctx, searchKey, data, startTime);
+            });
     } else {
         // This node is a follower - wait for cache to be populated
-        vertx.setTimer(100, id -> queryAllNodes(ctx, searchKey, startTime));
+        vertx.setTimer(50, id -> {
+            String data = SharedDataManager.getCachedData(vertx, searchKey);
+            respondWithCacheResults(ctx, searchKey, data, startTime);
+        });
     }
 }
 ```
 
-##### 4. **Modified Node Class** - Cache-First Strategy
-Located at: [consumer-service/src/main/java/com/griddynamics/consumer/models/Node.java](consumer-service/src/main/java/com/griddynamics/consumer/models/Node.java)
+**Key Changes from Original:**
+- **No separate Node class**: All logic consolidated in ConsumerVerticle
+- **Cache-first approach**: Check cache before any election or fetching
+- **Reduced wait time**: Followers wait only 50ms (down from 100ms)
+- **Direct response**: No aggregation of 50 node results - single response with data
 
-- **Before**: Each node made HTTP requests to the producer
-- **After**: Each node only checks the distributed cache
+#### Vert.x-Only Implementation
 
-```java
-public Future<Boolean> checkData(String searchKey) {
-    var cache = HazelcastManager.getDataCache();
-    
-    if (cache.containsKey(searchKey)) {
-        logger.debug("[{}] Cache HIT for key: {}", nodeId, searchKey);
-        return Future.succeededFuture(true);
-    }
-    
-    logger.debug("[{}] Cache MISS for key: {}", nodeId, searchKey);
-    return Future.succeededFuture(false);
-}
-```
+**No External Dependencies Required!**
 
-#### Updated Dependencies
+The solution uses only Vert.x built-in features:
+- `vertx.sharedData().getLocalMap()` - Shared in-memory cache
+- Java `synchronized` keyword - Thread-safe leader election
+- `vertx.setTimer()` - Asynchronous wait for followers
 
-Added to [consumer-service/pom.xml](consumer-service/pom.xml):
+Dependencies in [consumer-service/pom.xml](consumer-service/pom.xml) remain minimal:
 
 ```xml
 <dependency>
-    <groupId>com.hazelcast</groupId>
-    <artifactId>hazelcast</artifactId>
-    <version>5.3.5</version>
+    <groupId>io.vertx</groupId>
+    <artifactId>vertx-web</artifactId>
+    <version>${vertx.version}</version>
+</dependency>
+<dependency>
+    <groupId>io.vertx</groupId>
+    <artifactId>vertx-web-client</artifactId>
+    <version>4.4.4</version>
 </dependency>
 ```
 
@@ -471,37 +485,50 @@ Added to [consumer-service/pom.xml](consumer-service/pom.xml):
 sequenceDiagram
     participant Client
     participant ConsumerAPI as Consumer API
-    participant Leader as Leader Node
-    participant Followers as Follower Nodes (49)
-    participant Cache as Hazelcast Cache
+    participant Leader as Leader Request
+    participant Follower as Follower Request
+    participant Cache as Vert.x SharedData<br/>(LocalMap)
     participant ProducerAPI as Producer API
     participant DB as MySQL Database
 
     Note over Client,DB: Optimized Search Flow (Single Request)
     
     Client->>+ConsumerAPI: GET /search?key=hello
-    ConsumerAPI->>ConsumerAPI: Elect Leader
+    ConsumerAPI->>+Cache: Check if data exists
+    Cache-->>-ConsumerAPI: Cache MISS
     
-    Note over Leader: Leader elected from 50 nodes
+    ConsumerAPI->>ConsumerAPI: Elect Leader (synchronized)
+    
+    Note over Leader: First request elected as LEADER
     
     Leader->>+ProducerAPI: Single GET / request
     ProducerAPI->>+DB: SELECT id, data FROM data_storage
     DB-->>-ProducerAPI: Return all records
     ProducerAPI-->>-Leader: JSON Array [{id, content}...]
     
-    Leader->>+Cache: Store data in distributed cache
+    Leader->>+Cache: Store data in shared cache
     Cache-->>-Leader: Data cached
     
-    par All Nodes Query Cache (Instead of Producer)
-        Leader->>Cache: Read from cache
-        Followers->>Cache: Read from cache (49 nodes)
-    end
+    Leader->>Leader: Read from cache
+    Leader-->>ConsumerAPI: Return data response
+    ConsumerAPI-->>-Client: JSON Response<br/>{searched_for, found, data, response_time_ms}
     
-    Cache-->>Leader: Data (if found)
-    Cache-->>Followers: Data (if found)
+    Note over Client,DB: Concurrent Request (Follower)
     
-    ConsumerAPI->>ConsumerAPI: Aggregate results from all nodes
-    ConsumerAPI-->>-Client: JSON Response<br/>{searched_for, nodes_found, response_time_ms}
+    Client->>+ConsumerAPI: GET /search?key=hello (concurrent)
+    ConsumerAPI->>+Cache: Check if data exists
+    Cache-->>-ConsumerAPI: Cache HIT (leader already cached)
+    ConsumerAPI-->>-Client: Immediate response from cache
+    
+    Note over Client,DB: OR if follower arrives during leader fetch:
+    
+    Follower->>ConsumerAPI: Concurrent request during leader fetch
+    ConsumerAPI->>Cache: Cache MISS (not yet populated)
+    ConsumerAPI->>ConsumerAPI: Not elected as leader
+    ConsumerAPI->>ConsumerAPI: Wait 50ms
+    ConsumerAPI->>Cache: Retry cache read
+    Cache-->>Follower: Cache HIT (leader populated it)
+    Follower-->>Client: Return cached data
 ```
 
 ### Benefits of the Solution
@@ -518,18 +545,23 @@ sequenceDiagram
 ### How It Works
 
 1. **Search Request Arrives**: Client sends `GET /search?key=hello`
-2. **Leader Election**: ConsumerVerticle initiates leader election using Hazelcast distributed lock
-3. **Leader Fetches**: Elected leader makes a **single HTTP request** to the producer
-4. **Cache Population**: Leader stores the response in Hazelcast distributed cache
-5. **Follower Wait**: Non-leader nodes wait 100ms for cache population
-6. **All Nodes Read Cache**: All 50 nodes check the distributed cache (no HTTP calls)
-7. **Aggregated Response**: Consumer service aggregates cache hit results and returns to client
+2. **Cache Check**: ConsumerVerticle checks Vert.x SharedData cache first
+3. **Cache Hit**: If data exists, return immediately (sub-millisecond response)
+4. **Cache Miss**: If data doesn't exist, proceed to leader election
+5. **Leader Election**: Use synchronized method to elect first request as leader
+6. **Leader Fetches**: Elected leader makes a **single HTTP request** to the producer
+7. **Cache Population**: Leader stores the response in Vert.x SharedData `LocalMap`
+8. **Leader Responds**: Leader returns the cached data immediately
+9. **Follower Wait**: Concurrent follower requests wait 50ms for cache population
+10. **Follower Responds**: Followers read from cache and return data directly
+
+**Note**: Only the **first request** per unique key makes an HTTP call. All subsequent requests (even concurrent ones) read from the shared cache.
 
 ### Testing the Solution
 
 #### Health Check Endpoint
 
-Check the consumer service health and cluster status:
+Check the consumer service health and producer connectivity:
 
 ```bash
 curl http://localhost:8081/health
@@ -540,7 +572,7 @@ Response:
 {
   "status": "UP",
   "consumer_service": "healthy",
-  "hazelcast_cluster": 1,
+  "node_id": "Consumer-Node-1234567890",
   "producer_service": "connected",
   "producer_status": 200,
   "timestamp": 1706745600000
@@ -557,9 +589,12 @@ Response:
 ```json
 {
   "searched_for": "hello world",
-  "total_nodes": 50,
-  "nodes_found": 50,
+  "found": true,
   "response_time_ms": 45,
+  "data": [
+    {"id": 1, "content": "hello world"},
+    {"id": 2, "content": "test data"}
+  ],
   "timestamp": 1706745600000
 }
 ```
@@ -567,18 +602,26 @@ Response:
 #### Observing the Behavior
 
 Check the logs to see:
-- **Leader election**: Only one node logs "elected as LEADER"
-- **Single request**: Only one HTTP request to producer at `localhost:8080`
-- **Cache operations**: 49 follower nodes log "Cache HIT" or "Cache MISS"
+- **First request**: Logs "Cache MISS" → "elected as LEADER" → "Fetching from Producer"
+- **Single HTTP call**: Only one request to producer at `localhost:8080`
+- **Subsequent requests**: Log "Cache HIT" → immediate response (no producer call)
+- **Concurrent requests**: Follower logs "waiting for leader" → reads from cache after 50ms
 
 ### Conclusion
 
 This implementation successfully transforms the **Thundering Herd** problem into an efficient **Request Collapsing** pattern:
 
 ✅ **Single request** instead of 50 simultaneous requests  
-✅ **Distributed caching** with Hazelcast for fast data access  
-✅ **Leader election** for coordination without race conditions  
-✅ **Reduced load** on producer service and database  
-✅ **Improved performance** and scalability  
+✅ **In-memory caching** with Vert.x SharedData for fast data access  
+✅ **Leader election** using synchronized methods for coordination  
+✅ **Reduced load** on producer service and database (98% reduction)  
+✅ **No external dependencies** - pure Vert.x solution  
+✅ **Simple and maintainable** - leverages JVM synchronization primitives  
 
-The solution demonstrates how distributed coordination patterns can dramatically reduce backend load while maintaining functionality across multiple consumer nodes.
+**Trade-offs:**
+
+⚠️ **Single JVM scope**: Vert.x SharedData `LocalMap` only works within a single JVM instance  
+⚠️ **No distributed clustering**: For multi-instance deployments, consider Redis or Hazelcast  
+⚠️ **Increased latency**: Followers wait 50ms for leader to populate cache  
+
+The solution demonstrates how Vert.x built-in features can effectively reduce backend load through request collapsing, making it ideal for single-instance deployments or when external caching infrastructure is not available.
