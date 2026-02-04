@@ -302,4 +302,4 @@ This project is for demonstration and educational purposes.
 
 ## Authors
 
-Grid Dynamics
+Anusruta Dutta
